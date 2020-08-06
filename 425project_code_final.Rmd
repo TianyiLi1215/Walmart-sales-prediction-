@@ -1,0 +1,784 @@
+
+---
+title: "STAT425 Final Project"
+subtitle: " Sales in Stormy Weather"
+author: "Yilin Zhu, Tianyi Li, Rongqi Gao, Jingyi Meng"
+date: " Dec 17th, 2019"
+output:
+  html_document: 
+    theme: cosmo
+    toc: yes
+  pdf_document: default
+urlcolor: BrickRed
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE,
+                      warning = FALSE,
+                      message = FALSE)
+```
+
+```{r message = FALSE}
+## Libraries
+library(tidyverse)
+library(caret)
+library(data.table)
+library(lubridate)
+library(bnstruct)
+library(RANN)
+library(doParallel)
+library(gridExtra)
+library(glmnet)
+library(lmtest)
+library(car)
+library(xgboost)
+library(kableExtra)
+library(factoextra)
+library(tibble)
+```
+
+```{r, include = FALSE}
+## Parallel Computing
+registerDoParallel(cores = 7)
+```
+
+***
+
+# Abstract
+
+> Linear regression models as well as statistical learning models were applied to Walmart sales data in order to predict future item sales based on attributes provided. A variety of modeling techniques were explored and validated. The predictive power of linear models seems to be limited and method of stochastic gradient descent appeared to be the most reasonable choice among the ten models we used in this project. Future data collection and analysis is recommended for the purpose of model improvement in performing the prediction task.
+
+***
+
+# Introduction
+
+The relationship between weather and business activities has been widely studied. By precisely predicting the sale of products based on some easily foreseeable features(such as holidays, weather conditions, special events, etc.), a store may better operate, avoiding understocking or overstocking, and thus, generate more profits. 
+
+The purpose of this project is to predict the sales of product related to the major weather events like snow storm. Great attention should be paid to forecast the sales amount of weather sensitive products. Weather information has been provided such as temperature, wind speed, snowfall, pressure etc. Prediction based on weather is more complicated and harder than some other features like holidays and events, since there are not much pattern lying in the weather information collected from different locations.
+
+To construct the predicting model, several statistical learning techniques have been employed, from basic linear model to ensemble methods, all focusing on regression problem. In this project, in total 10 models were covered. The best model which is a stochastic gradient descent model is able to make a promising prediction on product sales with a kaggle competition score which is the root mean squared logarithmic error of 0.1202.
+
+***
+
+# Methods and Results
+
+## 1. Data Preprocessing and Feature Engineering
+
+The data was accessed via a competition launched by Walmart, in Kaggle.[^1] It contains four data tables, train data, test data, weather information data as well as the key to connect train and test data to the weather data. There are in total 45 stores. 111 weather sensitive products are sold in stores at 45 different Walmart locations. The 45 locations are covered by 20 weather stations, from which the weather information data was collected. The task is to predict the amount of each product sold. 
+
+```{r message = FALSE}
+## Read data
+tst_data = read_csv('D:/425project/test.csv')
+key = read_csv('D:/425project/key.csv')
+weather = read_csv('D:/425project/weather.csv', na = c("M", "-"))
+trn_data = read_csv('D:/425project/train.csv')
+```
+
+Weather dataset was preprocessed first. The variable 'codesum' has been removed for predicting because of the complexity to be processed and used. Another useful feature 'week' was created based on date, to represent if day is a weekday or weekend day. It's reasonable to assume that customers tend to do more shopping on weekends than on weekdays.
+
+```{r}
+## Weather Preprocess
+weather$snowfall = weather$snowfall%>%
+  replace(which(weather$snowfall == 'T'), 0.01)
+
+weather = weather%>%
+  select(-codesum)%>%
+  mutate(sunrise = as.numeric(sunrise),
+         preciptotal = as.numeric(preciptotal),
+         resultdir = as.numeric(resultdir),
+         snowfall = as.numeric(snowfall),
+         week = wday(as.Date(date, '%Y-%m-%d')),
+         week = ifelse(week == 1 | week == 7, 'weekend', 'weekday'),
+         week = as.factor(week)
+  )
+```
+
+The huge amounts of missing values in the weather data are the main concern in the data preprocessing process. In this project, the bagged tree imputation was applied to solve this problem.[^2] The theory behind it is that for each predictor in the data, a bagged tree is created using all of the other predictors in the training set. When a new sample has a missing predictor value, the bagged model is used to predict the value.
+
+```{r bag-imputation, include=FALSE}
+## Weather Imputation
+set.seed(425)
+prepro_mod = preProcess(weather[, - c(1, 2, 20)], 
+                        method = 'bagImpute',
+                        na.remove = FALSE)
+
+weather_impu = weather
+weather_impu[, - c(1, 2, 20)] = predict(prepro_mod, 
+                                        weather[, - c(1, 2, 20)])
+```
+
+```{r test the goodness of imputation, echo=FALSE}
+## Test the goodness of imputation
+tmp = do.call(cbind, lapply(weather[, - c(1, 2, 20)], summary))[1: 6, ]
+tmp2 = do.call(cbind, lapply(weather_impu[, - c(1, 2, 20)], summary))
+tmp - tmp2
+```
+
+The table above shows the differences between the original weather data and the data after imputation. Differences are sufficiently small in most variables. Moreover, since `sunrise` and `sunset` are both represented in time format(hh:mm), their slightly higher differences could be overlooked. Therefore, we may conclude that this imputation is successful and helpful.
+
+The training dataset was left joined by key dataset with 'store_nbr' and then left joined with imputed weather dataset by 'station_nbr' and 'date'.
+
+```{r joining, include=FALSE}
+## Create train join data
+trn_join = trn_data%>%
+  left_join(key, by = 'store_nbr')%>%
+  left_join(weather_impu, by = c('station_nbr', 'date'))
+```
+
+The last important change done on data is the discard of "useless" samples. "Useless" samples, are defined as follows : If a specific item from a specific store was never sold through all dates, this sample is treated as an "useless" sample and was discarded from the training dataset. The "useless" samples might exist because there are items that were never on stock in specific stores. 
+
+We created a new variable called 'Sum'. 'Sum' measures the sum units sold of one specific item in one specific store during the entire time. If sum is zero, then that item but not be included in the training dataset to fit the model. Upon doing so, the volume of total dataset was reduced by almost 95%. 
+
+```{r include=FALSE}
+## Create new variable sum for train data
+trn_join = trn_join %>%
+  group_by(store_nbr,item_nbr) %>%
+  mutate(sum = sum(units)) 
+
+## Split train into zero and nonzero
+nonzero_trn = trn_join %>%
+  filter(sum != 0) %>%
+  select(- sum)
+
+zero_trn = trn_join %>%
+  filter(sum == 0) %>%
+  select (- sum)
+
+###（nonzero_trn_new）data is ready to fit function
+## Delete useless columns
+nonzero_trn_new = subset(nonzero_trn, 
+                 select = -c(date, store_nbr, station_nbr))
+
+nonzero_trn_new = nonzero_trn_new %>%
+  mutate(item_nbr = as.factor(item_nbr))
+
+zero_trn_new = subset(zero_trn, 
+                 select = -c(date, store_nbr, station_nbr))
+
+zero_trn_new = zero_trn_new %>%
+  mutate(item_nbr = as.factor(item_nbr))
+```
+
+Moreover, since we assume the "useless" item will not be sold in all situations, the sale unit of that 'useless' item-store combination would simply be filled with zero over all dates in the test dataset.
+
+```{r include=FALSE}
+## Create test data (tst_data_index_zero)
+zero_trn_index = zero_trn %>%
+  select (c(store_nbr, item_nbr, units))
+
+zero_trn_index = zero_trn_index[!duplicated(zero_trn_index),]
+
+tst_data_index_zero = tst_data %>%
+  left_join(zero_trn_index, by = c('store_nbr','item_nbr'))
+
+tst_data_index_zero$item_nbr = as.factor(tst_data_index_zero$item_nbr)
+
+### (nonzero_tst_new) data is ready to run for predict function
+
+## Create nonzero test data 
+nonzero_tst = tst_data_index_zero[is.na(tst_data_index_zero$units),]
+
+nonzero_tst_new = nonzero_tst%>%
+  left_join(key, by = 'store_nbr')%>%
+  left_join(weather_impu, by = c('station_nbr', 'date'))
+```
+
+After data preprocessing and feature engineering, in our final training dataset for model fitting, there are in total 236038 samples, 19 features and one response variable. Detailed information shown in appendix. 
+
+## 2. Exploratory Data Analysis
+
+The dataset that we used to do exploratory data analysis is the dataset without missing value imputation. Training dataset was left joined by key dataset with 'store_nbr' and then left joined with weather dataset by 'station_nbr' and 'date'.
+
+```{r data manipulation for EDA}
+#### join train for EDA
+trn_data_eda = trn_data%>%
+  left_join(key, by = 'store_nbr')%>%
+  left_join(weather, by = c('station_nbr', 'date'))
+
+#### create new variable sum
+new_trn_eda = trn_data_eda %>%
+  group_by(store_nbr,item_nbr) %>%
+  mutate(sum = sum(units)) 
+
+not_zero_trn_eda = new_trn_eda %>%
+  filter(sum != 0)
+
+#### create new variable day 
+not_zero_trn_eda = not_zero_trn_eda %>%
+  mutate(day = wday(as.Date(date))) 
+
+not_zero_trn_eda$day = factor(case_when(
+  not_zero_trn_eda$day == "7" ~ "weekends",
+  not_zero_trn_eda$day == "1" ~ "weekends",
+  TRUE ~ "weekday"
+  ))
+```
+
+```{r, EDA ggplot, fig.height=7, fig.width =7, include = FALSE}
+p1 = ggplot(not_zero_trn_eda,aes(x = sum))+geom_histogram(fill="darkolivegreen3")+xlab("Sum of Units (non-zero)")+
+  ggtitle("Fig 2. Distribution of Sum of Units")
+
+p2 = ggplot(not_zero_trn_eda,aes(x=tmin))+geom_histogram(bins=35,fill="powderblue")+xlab("Minimum temperature")+
+  ggtitle("Fig 3. Distribution of min temp")
+
+p3 = ggplot(not_zero_trn_eda,aes(x = as.numeric(avgspeed)))+geom_bar(fill="darkolivegreen3")+xlab("Sum of Units (non-zero)")+
+  ggtitle("Fig 4. Distribution of wind speed")
+
+p4 = ggplot(not_zero_trn_eda,aes(x=snowfall))+geom_histogram(bins=35,fill="powderblue")+xlab("Minimum temperature")+
+  ggtitle("Fig 5. Distribution of snowfall")
+
+p5 = ggplot(not_zero_trn_eda,aes(x=sunrise))+geom_histogram(bins=35,fill="powderblue")+xlab("sunrise")+
+  ggtitle("Fig 6. Distribution of sunrise")
+
+#######
+#unit ~ weekday
+p6 = ggplot(not_zero_trn_eda,aes(x=sum,fill=day))+
+  geom_histogram()+xlab("weekday")+  ylab("Units")+
+  facet_grid(~day)
+  ggtitle("Fig 7. Units ~ Weekday")
+
+```
+
+```{r,fig.height=5, fig.width =7}
+count_amounts  = function(data, amount) {
+  sum(data$units == amount)
+}
+
+small_amounts = c(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10)
+barplot(purrr::map_dbl(small_amounts, count_amounts, data = not_zero_trn_eda), 
+        names.arg = small_amounts,
+        main = "Fig 1. Counts of Small Amounts in Training Data",
+        ylim = c(0, 130000), ylab = "Count",
+        xlab = "Amount")
+box()
+grid()
+```
+
+From figure 1 of "Counts of Small Amounts", it is found that within this data, there are a large number of units has a value of 0. The rate of occurrence of units for 0 far exceeds those for 1 through 10. This information indicate most of the items were not sold. Potential reasons for the great proportion of 0 units would be that some of the items were out of stock in many stores. Predicting the sale amount of these 0-units items would not be meaningful. 
+
+```{r,fig.height=14, fig.width = 10}
+gridExtra::grid.arrange(p1, p2, p3, p4, p5, p6, ncol = 2)
+```
+
+From figure 2, the Distribution of sum of units grouped by stores and items, it is showed that although the maximum value sum can be 189903, over half of the counts sum were concentrated below 1000. And from figure 3, Minimum temperature showed a right skewed distribution with a minimum value of -21 F and a maximum value of 88 F. The majority were concentrated between 34 to 65 F. In terms of wind speed, data were concentrated between 5.2 to 10 km/h, with a minimum of 0 and a maximum of 28.7 km/h. For the snowfall, over 90% of the observations has a snowfall amount of zero, indicating the snowy weather is rare in this area. For the distribution of sunrise, the majority group are within 531 and 652, indicating there may not exist significant differences.
+
+It’s not surprising that the whether the day is a weekday or a weekend day affected the sales amount. There were differences exist that more sales happened during weekdays while the distribution for these two categories share a similar shape.
+
+## 3. Models and Results
+
+### 3.1 Ordinary Least Squares Regression 
+
+#### 3.1.1 The OLS Model
+
+Ordinary least squares (OLS) is a method assuming there are relationships between a series of independent variables and dependent variables.[^9] The least-square estimators are generated by minimizing the sum of squared error (the difference between the actual and predicted values). It would be appropriate to first fit a basic OLS model to get an overview of the relationship and apply different methods like variable selection to improve the model performance.
+
+```{r, include = FALSE}
+raw_model = lm(units~., nonzero_trn_new)
+summary(raw_model)
+```
+
+```{r, fig.height = 8, fig.width= 8}
+par(mfrow = c(2,2))
+plot(raw_model)
+```
+
+```{r, include = FALSE}
+bptest(raw_model)
+```
+
+Variables used in the OLS model are shown below:  
+
+```{r echo=FALSE}
+tibble(
+"Variables(1-10)" = c("item_number", "units", " maximum temperature", "minimum temperature", " average temperature", "depart", "dewpoint", "wetbulb", "heat", "cool"),
+"Class(1-10)" = c("factor", "numeric", "numeric", "numeric", "numeric", "numeric", "numeric", "numeric", "numeric", "numeric"), 
+"Variables(11-20)" = c("sunrise", "sunset", "snowfall", "preciptotal", "average station pressure", "sealevel", "resultspeed", "resultant direction", " average wind speed", "week"),
+"Class(11-20)" = c("numeric", "numeric", "numeric", "numeric", "numeric", "numeric", "numeric", "numeric", "numeric", "factor")
+  ) %>% 
+  kable(digits = 6, caption = "Table: Class of All the OLS Variables") %>%
+  kable_styling("striped", full_width = FALSE)
+```
+
+#### 3.1.2 Diagnostics
+
+For the fitted OLS model, we have 37 significant “item number” variables and 11 “weather” variables. 
+
+Diagnostic was performed to validate the model and check the assumptions of the linear model. From the Residual Versus Fitted plot as well as the Scale-Location plot, we could check the linearity and constant variance assumptions. As shown in these two plots, there was no pattern of the variance with the increase of the fitted value, indicating homoscedasticity. A Breusch-Pagan test was used and the p-value turned to be 0.2593, which is less than 0.05 to further prove the constant variance is not violated. 
+
+From the Normal Q-Q plot, normality of the distribution of errors was checked. It is found that there are many points deviate from the line, indicating the normality assumption is violated. Considering the large sample size, shapiro-wilk test was not performed.
+
+From the Residuals vs Leverage plot, with a cut off value of 0.05 for the Cook's distance, there were no influential points detected.
+
+#### 3.1.3 Results
+
+After performing prediction on the test data set, we got a Kaggle score of $0.2047$. 
+
+From the diagnostic plots, it is found that the ordinary least square model had some limitations and violate the assumptions. Future improvements such as variable selection method, transformation method, shrinkage methods etc. need to applied in order to improve this model.  
+
+### 3.2 Poisson Regression 
+
+#### 3.2.1 The Poisson Model
+
+If customers buy the products independently and at a constant rate, then the distribution of the units should follow a poisson distribution. If so, a generalized linear model could be fitted. We assumed our response variable follow a poisson distribution and fitted a generalized linear model with poisson family. 
+
+```{r}
+pois_model = glm(units ~., family = "poisson", nonzero_trn_new)
+```
+
+```{r, fig.height = 8, fig.width= 8}
+par(mfrow = c(2,2))
+plot(pois_model)
+```
+
+```{r, include = FALSE}
+pchisq(pois_model$deviance, df=pois_model$df.residual, lower.tail=FALSE)
+
+## Overdispersion
+X.2 = sum(residuals(pois_model,type="pearson")^2)
+phihat = X.2 / df.residual(pois_model)
+```
+
+#### 3.2.2 Results
+
+Kaggle score of the poisson model is $0.3184$.
+
+We were not surprised by the high Kaggle score. We calculated the p-value for the deviance goodness of fit test, and got a test score of zero. Therefore we got the conclusion that our model showed lack of fit. We should reject the null hypothesis that the response variable follows a poisson distribution. Also, the overdispersion is 16.66416, it explains the apparent lack of fit. Diagnostic plots show that even after the transformation through link function, the distribution of error is not normal. There are some apparent outliers and influential points. We submitted our score to Kaggle, and got a high score of 0.3184. 
+
+Evidence shows that our response variable does not follow a poisson distribution. This makes sense, since the buying rate is very likely to be not constant. It is affected by many factors including date and weather conditions. Also many Y values are zero, and u is very small.
+
+### 3.3 Box Cox Transformation 
+
+Since the normality assumption of the OLS appears to be violated and we want to reduce the non-normality, Box-Cox transformation is used. From the Box-Cox plot, we believe that 0 is a reasonable choice, since the range of response is huge. The p-value of Breusch-Pagan test is 2.2 * 10^-16 < 0.05 indicates that we can reject the null hypothesis and claim the error variance is not constant.
+
+```{r}
+### Box-cox transformation
+library(MASS)
+ols_mod = lm(units+1 ~ ., nonzero_trn_new)
+
+boxcox(ols_mod)
+
+trans_mod = lm(log(units+1) ~ ., nonzero_trn_new)
+```
+
+```{r,fig.height = 8, fig.width = 8}
+### Diagnostic of transformed model
+par(mfrow = c(2,2))
+plot(trans_mod)
+```
+
+```{r, include = FALSE}
+### check constant variance
+bptest(trans_mod)
+```
+
+#### Results
+
+After applying log-transformation of the response variable, the diagnostic plot seems to be hugely improved, therefore the log-transform were used for almost all models later.
+
+Kaggle score of the box cox transformed model is $0.1478$.
+
+### 3.4 Variance Inflation Factor
+
+Variance inflation factor (VIF) performs as an indicator, to detect the existence of multicollinearity. When many predictors are highly correlated, the values and sampling variance of these regression coefficients might be highly dependent on only several particular predictors. Therefore, it's necessary to find out predictors with high VIF, exclude them to refit the linear model, to investigate whether they do affect the model in bad ways.
+
+```{r}
+vif(trans_mod)
+```
+
+The generalized VIF for the original log-transformed model is shown above. Generalized VIF is developed to measure the VIF of categorical variables. It's the same as simple VIF when degree of freedom is 1. The threshold of generalized VIF is set at 5.
+
+A new linear model with all VIFs lower than the threshold could be constructed as follows:
+
+Step 1: Remove the predictor with highest generalized VIF.
+
+Step 2: Refit the log-transformed linear model, without the formerly excluded predictor.
+
+Step 3: Check the VIFs of this new model.
+ 
+Step 4: Repeat step 1 to step 3 until all predictors whose VIF larger than the threshold are excluded.
+
+```{r}
+trans_mod.ex = lm(log(units+1) ~ . - tavg - heat - wetbulb - tmin - tmax - resultspeed - sunset, nonzero_trn_new)
+vif(trans_mod.ex)
+```
+
+The VIFs for final log-transformed model is as above. Seven predictors have been excluded, including average temperature, minimum temperature, maximum temperature, heat, wet bulb, resultant wind speed as well as sunset.
+
+#### Results
+
+Kaggle score of the model after VIF variable selection is $0.1481$.
+
+The model after VIF selection did not provide us lower Kaggle score than the one without any variable deductions. Among the seven features that were deleted, some may still be useful for our units prediction.
+
+### 3.5 The Bayesian Information Criterion Models
+
+```{r, include = FALSE}
+#### The BIC backward Model
+bic_mod = step(trans_mod, direction = "backward", trace = FALSE, k = log(nrow(nonzero_trn_new)))
+```
+
+```{r, include = FALSE}
+#### The BIC forward Model
+trans_mod_new = lm(log(units+1) ~ 1, nonzero_trn_new)
+stepwise = step(trans_mod_new, direction = "forward", scope = list(upper = trans_mod, lower = ~1), trace = FALSE, k=log(nrow(nonzero_trn_new)))
+```
+
+After checking VIFs, it is recommended to perform variable selection of BIC method with a heavier penalty. BIC is derived from a Bayesian concept, and tends to select a model with the lowest BIC. We performed a backward selection starting from the full model with a log transformation as well as a forward selection starting from the intercept-only model. The model with the lowest BIC was chosen.
+
+The BIC with backward selection and forward selection are shown below:
+
+- Backward selection: log(units + 1) ~ item_nbr + tmin + dewpoint + wetbulb + heat + cool + sunrise + sunset + snowfall + preciptotal + stnpressure + sealevel + resultdir + avgspeed + week
+
+- Forward selection: log(units + 1) ~ item_nbr + cool + sunrise + sunset + resultspeed + week + stnpressure + sealevel + avgspeed + resultdir + preciptotal + tmin + dewpoint + snowfall
+
+#### Results
+
+It turned out these two models selected different subsets of variables. Predictions were made for both models on the test data set and the error metric was evaluated by submitting a file via Kaggle. The BIC backward and BIC forward models achieved a score of 0.1477 and 0.1479, respectively. 
+
+The BIC model was our best linear model. The promising prediction is related to the penalty terms that could avoid overfitting, and the proper selection of variables by BIC.
+
+### 3.6 The Lasso Model
+
+The lasso method belongs to shrinking methods in linear model regularization. By adding a L1-norm shrinkage penalty to the original residual sum of squares, the least squares estimation could shrink the estimates of coefficients to zero. Unlike ridge regression which could only reduce the magnitudes of coefficients and will not result in exclusion of any variables, the Lasso method may exclude some coefficients, based on the choice of $\lambda$.
+
+There are lots of variables in this dataset, either categorical or numerical. Especially the categorical variable 'item number' created a huge trouble in the linear regression with ordinary least squared. It was transformed to 111 binary variables when fitting the linear model. Such huge amounts of variables made the model more difficult to be fitted as well as interpreted. 
+
+Therefore, the lasso method has been introduced, in order to exclude some predictors that did not perform well on interpreting the response. By shrinking the coefficients and variable selection, the problem of overfitting could be avoided. The model might be built more precisely and easier to be interpreted.
+
+```{r}
+trn_x = model.matrix(ols_mod)
+trn_y = log(nonzero_trn_new$units + 1)
+set.seed(425)
+lasso_mod = cv.glmnet(trn_x, trn_y, alpha = 1, lambda = 10 ^ seq(-3, 3, by = 0.1))
+```
+
+```{r plot, warning = FALSE}
+plot(lasso_mod$glmnet.fit, xvar = 'lambda', label = TRUE)
+abline(v = log(lasso_mod$lambda.min), col = 'red', lty = 2)
+abline(v = log(lasso_mod$lambda.1se), col = 'black', lty = 2)
+grid()
+legend('topright', legend = c("lambda.min", "lambda.1se"), col = c("red", "black"), lty = 2)
+```
+
+Five - fold cross validation was employed to select the best penalty coefficient $\lambda$. From the shrinking plot above, the lambda with minimum mean-squared error would only reduce several predictors. However, the lambda with one standard error is able to remove over thirty predictors. We used lambda.1se in our model to reduce predictors and got more stable test result.
+
+#### Results
+
+Kaggle score of the Lasso model is $0.1482$.
+
+Our lasso model didn’t show lower Kaggle prediction scores comparing with the BIC backward model. The variables selected by the lasso model are shown in appendix. The lasso model might have excluded some useful variables. 
+
+## 4. Improvement 
+
+### Extra Methods
+
+We fitted two extra models, an eXtreme gradient boosting and a stochastic gradient descent model on our data. Both algorithms descend the gradient of a differentiable loss function. Gradient descent descends the gradient by introducing changes to parameters, whereas gradient boosting descends the gradient by introducing new models.[^3] The algorithms are widely used and are likely to provide us with powerful prediction models to predict the selling units. 
+
+All the models were trained using five fold cross-validation techniques through the use of the `caret` package. RMSE was used as the tuning metric. Our extra models showed lower kaggle scores comparing with our previous linear models. The best model is the improved stochastic gradient descent model, which gives us a score of 0.12024 in Kaggle public subset and 0.11997 in Kaggle private subset. 
+
+#### Stochastic Gradient Descent
+
+Stochastic gradient descent is a variant of the gradient descent.[^4] Stochastic gradient descent only takes one sample to go through the gradient descent in each iteration. The computational time and cost could be greatly reduced using stochastic gradient descent compared with the regular gradient descent.
+
+Gradient descent is one of the most common optimization algorithms in machine learning. It is a first-order optimization algorithm. It calculates the first derivative of the loss function with respect to each parameter to perform updates on the parameters in iterations. Gradient descent uses the derivatives to find where the loss function reaches its lowest value. Gradient descent finds the minimum value by taking steps from an initial guess until it reaches the best value. 
+
+Specifically, all the parameters are set at random numbers in the beginning. Then on each iteration, the first order derivative of the loss function is taken with respect to each parameter. For each parameter, the derivative with respect to parameter will be multiplied by the learning rate, and then subtracted from the old parameter to form the new parameter for the next iteration.[^5] The parameters are updated in the opposite direction of the gradient of the function. It will follow the direction of the slope downhill until a local minimum is reached. Gradient descent stops when the step size is very close to zero. If there have been more than the maximum number of steps, even if the step size is large, the gradient descent will stop.
+
+Since the derivatives converge toward zero in each iteration, the step size of each iteration gets smaller and smaller. Gradient descent only does a few calculations far from the optimal solution, and increases the number of calculations closer to the optimal value. Step size is also determined by learning rate, and the learning rate could be trained as well in the model. 
+
+Our stochastic gradient descent was fitted with the training dataset that we constructed before. The response variable is the log transformation of units, and all the features in the training dataset are used to fit the model.
+
+```{r include=FALSE}
+gbmGrid = expand.grid(n.trees = 500,
+                      interaction.depth = c(1, 2, 4),
+                      shrinkage = 0.1,
+                      n.minobsinnode = c(10, 20))
+gbmControl = trainControl(method = 'cv', number = 5)
+set.seed(425)
+gbm_mod = train(log(units+1) ~ .,
+                data = nonzero_trn_new,
+                method = 'gbm',
+                metric = 'RMSE',
+                trControl = gbmControl,
+                tuneGrid = gbmGrid,
+                verbose = FALSE)
+```
+
+In our improved stochastic gradient descent model, we took one step further to rethink the features in the training dataset, and prepared a new training dataset that has only three features, item number, store number and days. 
+
+This is because the weather data is very complicated and the weather conditions are highly related to the date. Weather is also changing periodically, and so is the customers' behavior. Comparing with the previous dataset, we eliminated all the weather features and used only date, item and store feature to fit our model. 
+ 
+The date was transformed to a numeric variable, by counting days from a randomly chosen date “2012-3-17”, for example, the date “2013-04-01” will be changed into “380” in the variable of days. We got this inspiration to deal with date from kaggle.[^6]
+ 
+We then fitted the stochastic gradient descent model.
+
+```{r include=FALSE}
+## fitting
+gbmGrid = expand.grid(n.trees = 500,
+                      interaction.depth = c(1, 2, 4),
+                      shrinkage = 0.1,
+                      n.minobsinnode = c(10, 20))
+gbmControl = trainControl(method = 'cv', number = 5)
+
+set.seed(425)
+gbm_mod1 = train(log(units+1) ~ item_nbr + store_nbr + days,
+                 data = train_z,
+                 method = 'gbm',
+                 metric = 'RMSE',
+                 trControl = gbmControl,
+                 tuneGrid = gbmGrid,
+                 verbose = FALSE)
+```
+
+#### EXtreme Gradient Boosting
+
+EXtreme gradient boosting is an optimized distributed gradient boosting library. It uses the gradient boosting framework, but with further optimization, to improve its performance in a large number of scenarios. The optimization and improvement methods are described below.[^7]
+
+EXtreme gradient boosting employs a regularizer, like the penalty term in ridge regression and lasso regression, to avoid the problem of overfitting. The loss function defined in eXtreme gradient boosting is the second-order Tayler expansion of errors, more precise than many other gradient boosting methods, which only use first-order Tayler expansion of errors. EXtreme gradient boosting constructs block structure for parallel learning. Each feature in one block is sorted by the corresponding feature value. Therefore, it realizes parallel computing when finding the best split points. The block structure ensures eXtreme gradient boosting to compute faster than many other gradient boosting methods.
+
+The tree pruning approach of eXtreme gradient boosting is also different from other methods. Unlike stochastic gradient boosting, where tree pruning stops once a negative loss is encountered, eXtreme gradient boosting grows the tree straight up to the max depth and then prunes backward until the improvement in loss function is below a threshold. In addition, it is designed to handle missing values internally, without pre-imputation needed. (This function was not used in our model)
+
+In R programming, data pre-processing for eXtreme gradient boosting is different from stochastic gradient boosting. It requires all data input to be numerical. Therefore, for categorical features, one-hot-encoding will be applied to transform them into numerical ones. Furthermore, for eXtreme gradient boosting, data frame must be converted into a matrix before it's utilized in the model, and xgb.DMatrix() function is recommended for implementing this process.[^8]
+
+```{r include=FALSE}
+nonzero_tst_xgboost = nonzero_tst_lasso
+trn_label = log(nonzero_trn_new$units + 1)
+tst_label = log(nonzero_tst_xgboost$units + 1)
+new_trn = model.matrix(~.+0, data = nonzero_trn_new[, -2])
+new_tst = model.matrix(~.+0, data = nonzero_tst_xgboost[, -2])
+
+X_trn = xgb.DMatrix(new_trn)
+X_tst = xgb.DMatrix(new_tst)
+```
+
+We then fitted our eXtreme gradient boosting model.
+
+```{r include=FALSE}
+xgbControl = trainControl(method = "cv",
+                          number = 5,  
+                          allowParallel = TRUE,
+                          verboseIter = FALSE,
+                          returnData = FALSE
+)
+set.seed(425)
+xgb_mod = train(X_trn,
+                trn_label,
+                method = "xgbTree",
+                metric = 'RMSE',
+                trControl = xgbControl
+)
+```
+
+#### Results
+
+Kaggle scores are shown below for our eXtreme gradient boosting model, a stochastic gradient descent model, and an improved version of the stochastic gradient descent model. 
+
+Our boosting models predicted better than the linear models, probably because of the optimization nature of the gradient descent algorithms. Models train weak learners sequentially, each trying to correct its predecessor. The parameters are carefully selected by steps in their local minimum range. Also, while least squares tries to find the derivative that equals zero, gradient descent is useful when it is not possible to solve for where the derivative equals zero. 
+
+```{r echo=FALSE}
+tibble(
+  "Model" = c("The eXtreme gradient boosting model", "The stochastic gradient descent model", "The improved stochastic gradient descent model"),
+  "Score" = c(0.14273, 0.14022, 0.12024)
+) %>% 
+  kable(digits = 4) %>% 
+  kable_styling("striped", full_width = FALSE)
+```
+
+# Conclusion
+
+In this project, we started with ordinary least square regression model, poisson regression model and then improved the model through box cox transformation, VIF selection, Lasso, BIC model selection. The linear models showed some limitations in the prediction task, however high interpretability. Our best performed linear model was the BIC model which has 15 features and the response variable units in log form. The best linear model’s kaggle score was 0.14773. 
+
+We further trained three extra boosting models. A stochastic gradient descent led us to a Kaggle score as low as around 0.12, showing great prediction performance. 
+
+Comparing the results of our stochastic gradient descent model that was fitted with or without weather features, the one without weather features showed better Kaggle score. Instead of with weather features, our best model was trained with date. This suggests that in addition to weather variables, there might exist other date related variables that affect the selling of products. Weather conditions are not the only variables that affect the sales. Further collection of data is recommended. Building models based on improvements on data collection, feature and model selection  may help to provide more accurate prediction information to the companies.
+
+The Kaggle scores for the ten models that we fitted are shown below.
+
+```{r echo=FALSE}
+tibble(
+  "Model" = c("Ordinary least square regression", "Poisson regression", "Ordinary least square regression with log transformation", "BIC Backward model","BIC forward model", "Lasso model", "VIF Model", "XGBoost Model", "Gradient descent model", "Improved gradient descent model"),
+  "Score" = c(0.20473, 0.31839, 0.14784, 0.14773, 0.14793, 0.14820, 0.14806, 0.14273, 0.14022, 0.12024)
+) %>% 
+  kable(digits = 4) %>% 
+  kable_styling("striped", full_width = FALSE)
+```
+
+# Appendix
+
+#### 1. Code for training data and testing data creation
+
+```{r eval=FALSE, echo=TRUE}
+## Create new variable sum for train data
+trn_join = trn_join %>%
+  group_by(store_nbr,item_nbr) %>%
+  mutate(sum = sum(units)) 
+
+## Split train into zero and nonzero
+nonzero_trn = trn_join %>%
+  filter(sum != 0) %>%
+  select(- sum)
+
+zero_trn = trn_join %>%
+  filter(sum == 0) %>%
+  select (- sum)
+
+###（nonzero_trn_new）data is ready to fit function
+## Delete useless columns
+nonzero_trn_new = subset(nonzero_trn, 
+                 select = -c(date, store_nbr, station_nbr))
+
+nonzero_trn_new = nonzero_trn_new %>%
+  mutate(item_nbr = as.factor(item_nbr))
+
+zero_trn_new = subset(zero_trn, 
+                 select = -c(date, store_nbr, station_nbr))
+
+zero_trn_new = zero_trn_new %>%
+  mutate(item_nbr = as.factor(item_nbr))
+
+## Create test data (tst_data_index_zero)
+zero_trn_index = zero_trn %>%
+  select (c(store_nbr, item_nbr, units))
+
+zero_trn_index = zero_trn_index[!duplicated(zero_trn_index),]
+
+tst_data_index_zero = tst_data %>%
+  left_join(zero_trn_index, by = c('store_nbr','item_nbr'))
+
+tst_data_index_zero$item_nbr = as.factor(tst_data_index_zero$item_nbr)
+
+### (nonzero_tst_new) data is ready to run for predict function
+
+## Create nonzero test data 
+nonzero_tst = tst_data_index_zero[is.na(tst_data_index_zero$units),]
+
+nonzero_tst_new = nonzero_tst%>%
+  left_join(key, by = 'store_nbr')%>%
+  left_join(weather_impu, by = c('station_nbr', 'date'))
+```
+
+
+#### 2. Variables selected by the lasso model
+
+```{r}
+coef(lasso_mod, s = lasso_mod$lambda.1se)
+```
+
+#### 3. Prediction code for the lasso model
+```{r eval=FALSE, echo=TRUE}
+#### Test data prediction function built for lasso model
+nonzero_tst_lasso = nonzero_tst_new[, -c(1, 2, 5)]
+nonzero_tst_lasso = replace_na(nonzero_tst_lasso, list(units = 0))
+tst_x = model.matrix(log(units+1) ~ ., data = nonzero_tst_lasso)
+log_lasso_pred = predict(lasso_mod, 
+                         s = lasso_mod$lambda.1se,
+                         newx = tst_x)
+```
+
+#### 4. Prediction code for the improved stochastic gradient descent model
+
+```{r eval=FALSE, echo=TRUE}
+## prediction
+pred1 = predict(gbm_mod1, nonzero_tst1)
+pred2 = exp(pred1) - 1
+
+nonzero_tst1$predict_units = round(ifelse(pred2 < 0, 0 , pred2))
+
+pred_results = nonzero_tst1[,c(1, 2, 3, 6)]
+
+## creating predicted set
+pred_results$date = as.Date(pred_results$date)
+pred_results$item_nbr = as.factor(pred_results$item_nbr)
+test_predicted = tst_data_index_zero %>%
+  left_join(pred_results,by=c("date", "store_nbr", "item_nbr") )
+test_predicted[is.na(test_predicted$units),]$units = test_predicted[is.na(test_predicted$units),]$predict_units
+test_predicted = test_predicted[-5]
+write.csv(test_predicted,"test_predicted.csv",row.names=FALSE)
+```
+
+#### 5. Prediction code for the rest of the models
+
+```{r eval=FALSE, echo=TRUE}
+## Predict on nonzero test data
+nonzero_tst_new$predict_units = exp(predict(trans_mod.ex, nonzero_tst_new)) - 1
+#nonzero_tst_new$predict_units = exp(log_lasso_pred) - 1
+
+### Create test predicted (test_predicted)
+
+## Change negative units to zero, and round prediction
+nonzero_tst_new$predict_units = ifelse(nonzero_tst_new$predict_units < 0, 0 , nonzero_tst_new$predict_units)
+nonzero_tst_new$predict_units = round(nonzero_tst_new$predict_units)
+
+## Bind nonzero test and zero test data 
+nonzero_tst_new_new = nonzero_tst_new [,c(1,2,3,24)]
+test_predicted = tst_data_index_zero %>%
+left_join(nonzero_tst_new_new,by=c("date", "store_nbr", "item_nbr") )
+test_predicted[is.na(test_predicted$units),]$units = test_predicted[is.na(test_predicted$units),]$predict_units
+test_predicted = test_predicted[-5]
+
+## Write test_predicted CSV
+write.csv(test_predicted,"test_predicted.csv",row.names=FALSE)
+```
+
+#### 6. Feature engineering for the improved stochastic gradient descent model
+
+```{r eval=FALSE, echo=TRUE}
+## use read.csv
+train1 = read.csv('D:/425project/train.csv')
+test1 = read.csv('D:/425project/test.csv')
+train1$days = as.numeric(as.Date(train1[,1],"%Y-%m-%d") - as.Date("2012-3-17","%Y-%m-%d"))/1.0
+test1$days = as.numeric(as.Date(test1[,1],"%Y-%m-%d") - as.Date("2012-3-17","%Y-%m-%d"))/1.0
+
+## train for modelling
+train1_d = train %>%
+  group_by(store_nbr,item_nbr) %>%
+  mutate(sum = sum(units)) 
+
+train1_z = train_d %>%
+  filter(sum != 0)
+
+## test for prediction 
+tst_data_index_zero1 = test1 %>%
+  left_join(zero_trn_index, by = c('store_nbr','item_nbr'))
+
+nonzero_tst1 = tst_data_index_zero1[is.na(tst_data_index_zero1$units),]
+```
+
+
+#### 7. Features in the training data set
+
+- `item_nbr` - The item number
+- `tmax` - Maximum temperature
+- `tmin` - minimum temperature
+- `tavg` - average temperature
+- `depart` - The departure of temperate from normal
+- `dewpoint` - Dew point 
+- `wetbulb` - Wet bulb 
+- `heat` - Heating
+- `cool` - Cooling
+- `sunrise` - Sunrise time
+- `sunset` - Sunset time
+- `snowfall` - Snowfall inches and tenths
+- `preciptotal` - Precipitation
+- `stnpressure` - Average station pressure
+- `sealevel` - Average sea level pressure
+- `resultspeed` - Resultant wind speed
+- `resultdir` - Resultant direction
+- `avgspeed` - Average wind speed
+- `week` - Either weekday or weekend day
+- `unit` - The response variable
+
+
+#  References
+
+[^1]: [Walmart Recruiting II: Sales in Stormy Weather](https://www.kaggle.com/c/walmart-recruiting-sales-in-stormy-weather/data)
+[^2]: [Bagged Tree Imputation](https://rstudio-pubs-static.s3.amazonaws.com/274015_89b386c285e94627969c309cd6d1a36e.html)
+[^3]: [Gradient Descent VS Gradient Boosting](https://datascience.stackexchange.com/questions/61501/what-is-the-difference-between-gradient-descent-and-gradient-boosting-are-they)
+[^4]: [Gradient Descent](https://towardsdatascience.com/gradient-descent-algorithm-and-its-variants-10f652806a3)
+[^5]: [Stochastic Gradient Descent](https://www.youtube.com/watch?v=sDv4f4s2SB8)
+[^6]: [Kaggle Discussion](https://www.kaggle.com/sushize/discussion)
+[^7]: [XGBoost](https://www.hackerearth.com/ja/practice/machine-learning/machine-learning-algorithms/beginners-tutorial-on-xgboost-parameter-tuning-r/tutorial/)
+[^8]: [eXtreme Gradient Boost with R](https://datascienceplus.com/extreme-gradient-boosting-with-r/)
+[^9]: [Ordinary least square regression](https://www.encyclopedia.com/social-sciences/applied-and-social-sciences-magazines/ordinary-least-squares-regression)
+
+
