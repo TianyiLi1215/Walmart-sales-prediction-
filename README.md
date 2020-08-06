@@ -1,2 +1,2 @@
 # Walmart-sales-prediction-
-R
+R, a thorough regression project
